@@ -25,3 +25,5 @@ This repository demonstrates a commitment to proper server security and manageme
 ---
 
 This serves as a transparency proof that this public server is managed following security best practices.
+
+ALL README.md Files are written by Hennes Bolte the Ansible playbook.yml with support from [Claude.ai](https://claude.ai)
