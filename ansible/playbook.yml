@@ -1,0 +1,313 @@
+---
+- name: Public Server Hardening and Monitoring
+  hosts: all
+  become: yes
+  vars:
+    ssh_port: 2222
+    backup_destination: /backup  # Ändern zu remote:/path für externes Backup
+    grafana_admin_password: "{{ lookup('env', 'GRAFANA_PASSWORD') | default('ChangeMe123!', true) }}"
+    
+  handlers:
+    - name: restart ssh
+      service:
+        name: ssh
+        state: restarted
+    
+    - name: restart fail2ban
+      service:
+        name: fail2ban
+        state: restarted
+    
+    - name: reload ufw
+      ufw:
+        state: reloaded
+
+  tasks:
+    # Phase 1: Grundlegende System-Updates
+    - name: Update package cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Safe upgrade packages
+      apt:
+        upgrade: safe
+        
+    - name: Install essential security packages
+      apt:
+        name:
+          - ufw
+          - fail2ban
+          - unattended-upgrades
+          - apt-listchanges
+          - lynis
+          - logrotate
+        state: present
+
+    # Phase 2: SSH-Sicherheit (VOR Firewall-Aktivierung!)
+    - name: Ensure .ssh directory exists
+      file:
+        path: /root/.ssh
+        state: directory
+        mode: '0700'
+        owner: root
+        group: root
+
+    - name: Check if SSH authorized_keys exists
+      stat:
+        path: /root/.ssh/authorized_keys
+      register: ssh_keys
+
+    - name: Fail if no SSH keys are configured
+      fail:
+        msg: "KRITISCH: Keine SSH-Keys gefunden! Bitte erst SSH-Keys einrichten, bevor Passwort-Auth deaktiviert wird."
+      when: not ssh_keys.stat.exists or ssh_keys.stat.size == 0
+
+    - name: Backup SSH config
+      copy:
+        src: /etc/ssh/sshd_config
+        dest: /etc/ssh/sshd_config.backup
+        remote_src: yes
+
+    - name: Configure SSH hardening
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?{{ item.key }}'
+        line: '{{ item.key }} {{ item.value }}'
+        validate: '/usr/sbin/sshd -t -f %s'
+      loop:
+        - { key: 'Port', value: '{{ ssh_port }}' }
+        - { key: 'PermitRootLogin', value: 'prohibit-password' }
+        - { key: 'PasswordAuthentication', value: 'no' }
+        - { key: 'PubkeyAuthentication', value: 'yes' }
+        - { key: 'ChallengeResponseAuthentication', value: 'no' }
+        - { key: 'X11Forwarding', value: 'no' }
+        - { key: 'MaxAuthTries', value: '3' }
+        - { key: 'ClientAliveInterval', value: '300' }
+        - { key: 'ClientAliveCountMax', value: '2' }
+        - { key: 'Protocol', value: '2' }
+      notify: restart ssh
+
+    # Phase 3: Firewall-Setup (BEVOR SSH neustartet!)
+    - name: Reset UFW to default
+      ufw:
+        state: reset
+
+    - name: Set UFW default policies
+      ufw:
+        direction: "{{ item.direction }}"
+        policy: "{{ item.policy }}"
+      loop:
+        - { direction: 'incoming', policy: 'deny' }
+        - { direction: 'outgoing', policy: 'allow' }
+
+    - name: Allow SSH on custom port
+      ufw:
+        rule: allow
+        port: '{{ ssh_port }}'
+        proto: tcp
+        comment: 'SSH'
+
+    - name: Allow HTTP
+      ufw:
+        rule: allow
+        port: '80'
+        proto: tcp
+        comment: 'HTTP'
+
+    - name: Allow HTTPS
+      ufw:
+        rule: allow
+        port: '443'
+        proto: tcp
+        comment: 'HTTPS'
+
+    - name: Allow Grafana
+      ufw:
+        rule: allow
+        port: '3000'
+        proto: tcp
+        comment: 'Grafana'
+
+    - name: Allow Prometheus
+      ufw:
+        rule: allow
+        port: '9090'
+        proto: tcp
+        comment: 'Prometheus'
+
+    - name: Enable UFW
+      ufw:
+        state: enabled
+
+    # Phase 4: Monitoring-Tools installieren
+    - name: Install monitoring packages
+      apt:
+        name:
+          - grafana
+          - prometheus
+          - prometheus-node-exporter
+        state: present
+
+    - name: Configure Prometheus
+      copy:
+        dest: /etc/prometheus/prometheus.yml
+        content: |
+          global:
+            scrape_interval: 15s
+            evaluation_interval: 15s
+
+          scrape_configs:
+            - job_name: 'prometheus'
+              static_configs:
+                - targets: ['localhost:9090']
+
+            - job_name: 'node'
+              static_configs:
+                - targets: ['localhost:9100']
+        backup: yes
+      notify: restart prometheus
+
+    - name: Set Grafana admin password
+      lineinfile:
+        path: /etc/grafana/grafana.ini
+        regexp: '^;?admin_password'
+        line: 'admin_password = {{ grafana_admin_password }}'
+        insertafter: '^\[security\]'
+      notify: restart grafana
+
+    - name: Configure Grafana datasource
+      copy:
+        dest: /etc/grafana/provisioning/datasources/prometheus.yml
+        content: |
+          apiVersion: 1
+          datasources:
+            - name: Prometheus
+              type: prometheus
+              access: proxy
+              url: http://localhost:9090
+              isDefault: true
+        backup: yes
+      notify: restart grafana
+
+    # Phase 5: Fail2ban konfigurieren
+    - name: Configure fail2ban jail for SSH
+      copy:
+        dest: /etc/fail2ban/jail.local
+        content: |
+          [DEFAULT]
+          bantime = 3600
+          findtime = 600
+          maxretry = 3
+          
+          [sshd]
+          enabled = true
+          port = {{ ssh_port }}
+          logpath = /var/log/auth.log
+          backend = systemd
+        backup: yes
+      notify: restart fail2ban
+
+    # Phase 6: Automatische Updates
+    - name: Configure unattended-upgrades
+      copy:
+        dest: /etc/apt/apt.conf.d/50unattended-upgrades
+        content: |
+          Unattended-Upgrade::Allowed-Origins {
+              "${distro_id}:${distro_codename}-security";
+          };
+          Unattended-Upgrade::AutoFixInterruptedDpkg "true";
+          Unattended-Upgrade::MinimalSteps "true";
+          Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+          Unattended-Upgrade::Remove-Unused-Dependencies "true";
+          Unattended-Upgrade::Automatic-Reboot "false";
+        backup: yes
+
+    - name: Enable automatic updates
+      copy:
+        dest: /etc/apt/apt.conf.d/20auto-upgrades
+        content: |
+          APT::Periodic::Update-Package-Lists "1";
+          APT::Periodic::Unattended-Upgrade "1";
+          APT::Periodic::AutocleanInterval "7";
+        backup: yes
+
+    # Phase 7: Backup-System
+    - name: Create backup directory
+      file:
+        path: '{{ backup_destination }}'
+        state: directory
+        mode: '0755'
+
+    - name: Create backup script
+      copy:
+        dest: /usr/local/bin/backup.sh
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          DATE=$(date +%Y%m%d_%H%M%S)
+          BACKUP_DIR="{{ backup_destination }}/$DATE"
+          mkdir -p "$BACKUP_DIR"
+          rsync -av --delete /var/www/ "$BACKUP_DIR/www/" 2>&1 | tee -a /var/log/backup.log
+          rsync -av /etc/ "$BACKUP_DIR/etc/" 2>&1 | tee -a /var/log/backup.log
+          # Alte Backups löschen (älter als 7 Tage)
+          find {{ backup_destination }} -maxdepth 1 -type d -mtime +7 -exec rm -rf {} \;
+
+    - name: Setup daily backup cron job
+      cron:
+        name: "Daily system backup"
+        minute: "0"
+        hour: "2"
+        job: "/usr/local/bin/backup.sh"
+
+    # Phase 8: Sicherheits-Audit
+    - name: Run Lynis security audit
+      shell: lynis audit system --quiet > /var/log/lynis-audit-$(date +%Y%m%d).log 2>&1
+      args:
+        creates: /var/log/lynis-audit-*.log
+      ignore_errors: yes
+
+    - name: Setup weekly Lynis audit
+      cron:
+        name: "Weekly security audit"
+        minute: "0"
+        hour: "3"
+        weekday: "0"
+        job: "lynis audit system --quiet > /var/log/lynis-audit-$(date +%Y%m%d).log 2>&1"
+
+    # Phase 9: Services starten
+    - name: Enable and start node_exporter
+      service:
+        name: prometheus-node-exporter
+        state: started
+        enabled: yes
+
+    - name: Enable and start Prometheus
+      service:
+        name: prometheus
+        state: started
+        enabled: yes
+
+    - name: Enable and start Grafana
+      service:
+        name: grafana-server
+        state: started
+        enabled: yes
+
+    - name: Enable and start fail2ban
+      service:
+        name: fail2ban
+        state: started
+        enabled: yes
+
+    # Phase 10: Abschluss-Infos
+    - name: Display security summary
+      debug:
+        msg:
+          - "=== Server Hardening abgeschlossen ==="
+          - "SSH Port: {{ ssh_port }}"
+          - "Grafana: http://{{ ansible_default_ipv4.address }}:3000 (admin/{{ grafana_admin_password }})"
+          - "Prometheus: http://{{ ansible_default_ipv4.address }}:9090"
+          - "WICHTIG: Teste SSH-Verbindung auf Port {{ ssh_port }} BEVOR du die aktuelle Sitzung beendest!"
+          - "Lynis Report: /var/log/lynis-audit-*.log"
+          - "Backup-Verzeichnis: {{ backup_destination }}"
