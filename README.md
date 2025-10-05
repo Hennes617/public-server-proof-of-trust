@@ -1,6 +1,5 @@
-# Public Server Proof of Trust
+# Public Server hardening
 
-This repository demonstrates a commitment to proper server security and management practices.
 
 ## Security
 
